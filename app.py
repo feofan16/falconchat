@@ -1,8 +1,10 @@
 # C:\F-ChatAI\app.py
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, ORJSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
 import json
@@ -15,12 +17,33 @@ from collections import defaultdict
 import numpy as np
 import os
 from urllib.parse import unquote
-# Импорт наших модулей
+import contextlib
+# наши модули
 from search_windows import AdvancedHybridSearch
 from ask_rag_chat import EnhancedRAGChat
 
+try:
+    import aiofiles  # pip install aiofiles
+    _HAVE_AIOFILES = True
+except Exception:
+    _HAVE_AIOFILES = False
 from psycopg2.pool import SimpleConnectionPool
 import re
+from secrets import token_urlsafe
+import mimetypes
+try:
+    import magic  # pip install python-magic-bin (Windows) / python-magic (Linux)
+    _HAVE_MAGIC = True
+except Exception:
+    _HAVE_MAGIC = False
+
+ALLOWED_MIME_BY_EXT = {
+    '.pdf':  {'application/pdf'},
+    '.docx': {'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/zip'},
+    '.doc':  {'application/msword','application/vnd.ms-word','application/x-msword'}, 
+    '.txt': {'text/plain'},
+    '.md':  {'text/markdown','text/plain'},
+}
 
 try:
     from rapidfuzz import process as rf_process, fuzz as rf_fuzz
@@ -54,7 +77,7 @@ REL_TIME_WORDS = re.compile(
 )
 
 SENSITIVE_RE = re.compile(
-    r'(?P<adult_hard>\b(?:инцест\w*|лоли|loli|детск\w*\s*порн\w*|(?<!\w)cp(?!\w)|зоофил\w*|bestialit\w*)\b)'
+    r'(?P<adult_hard>\b(?:инцест\w*|лоли|loli|детск\w*\s*порн\w*|(?<![A-Za-z0-9])cp(?=[^A-Za-z0-9]|$)(?!\s?12(?:5[01]|08))|зоофил\w*|bestialit\w*)\b)'
     r'|(?P<adult>\b(?:18\+|nsfw|xxx|порно|порн\w*|эротик\w*|'
     r'гей|лесби|gay|'
     r'секс\w*|интим\w*|нюдс?|nudes?|nude|'
@@ -118,7 +141,8 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Falcon AI Assistant",
     description="Интеллектуальный помощник по документации Falcon",
-    version="3.1.0"
+    version="3.1.0",
+    default_response_class=ORJSONResponse
 )
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -138,6 +162,17 @@ MEDIA_ROOT.mkdir(parents=True, exist_ok=True)  # на всякий случай 
 # статическая раздача картинок, на которые ссылается Markdown: /media/...
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
+# рядом с MEDIA_ROOT/DOCS_ROOT:
+ALLOWED_EXTS = {'.pdf', '.docx', '.doc', '.txt', '.md'}
+MAX_SIZE = 20 * 1024 * 1024  # 20 MB
+
+UPLOADS_ROOT = Path(os.getenv(
+    "UPLOADS_ROOT",
+    r"C:\\F-ChatAI\\uploads" if os.name == "nt" else "/opt/f-chatai/uploads"
+))
+UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
 DOCS_ROOT = Path(os.getenv(
     "DOCS_ROOT",
     r"C:\\F-ChatAI\\documents" if os.name == "nt" else "/opt/f-chatai/documents"
@@ -150,10 +185,12 @@ JS_ROOT = Path(os.getenv(
     "JS_ROOT",
     r"C:\\F-ChatAI\\js" if os.name == "nt" else "/opt/f-chatai/js"
 ))
+JS_ROOT.mkdir(parents=True, exist_ok=True)  
 app.mount("/js", StaticFiles(directory=str(JS_ROOT)), name="js")
 
 
-# CORS для веб-интерфейса
+
+# CORS для веб-интерфейса без ограничений
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -161,49 +198,59 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 @app.post("/api/training")
 async def api_training(payload: TrainingPayload, request: Request):
     user = get_user_identifiers(request)
-    conn = DB_POOL.getconn()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO user_actions
-                    (action_type, session_id, user_domain, computer_name, metadata, created_at)
-                    VALUES ('training_submit', %s, %s, %s, %s, NOW())
-                """, (
-                    user.get("computer_name"),
-                    user.get("domain"),
-                    user.get("computer_name"),
-                    json.dumps(payload.dict(), ensure_ascii=False)
-                ))
-        return {"status": "success", "message": "Материалы получены"}
-    finally:
-        DB_POOL.putconn(conn)
+
+    def _work():
+        conn = DB_POOL.getconn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO user_actions
+                        (action_type, session_id, user_domain, computer_name, metadata, created_at)
+                        VALUES ('training_submit', %s, %s, %s, %s, NOW())
+                    """, (
+                        user.get("computer_name"),
+                        user.get("domain"),
+                        user.get("computer_name"),
+                        json.dumps(payload.dict(), ensure_ascii=False),
+                    ))
+        finally:
+            DB_POOL.putconn(conn)
+
+    await run_in_threadpool(_work)
+    return {"status": "success", "message": "Материалы получены"}
+
 
 
 @app.post("/api/feedback")
 async def api_feedback(payload: InaccuracyFeedback, request: Request):
     user = get_user_identifiers(request)
-    conn = DB_POOL.getconn()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO user_actions
-                    (action_type, session_id, user_domain, computer_name, metadata, created_at)
-                    VALUES ('feedback_inaccuracy', %s, %s, %s, %s, NOW())
-                """, (
-                    user.get("computer_name"),
-                    user.get("domain"),
-                    user.get("computer_name"),
-                    json.dumps(payload.dict(), ensure_ascii=False)
-                ))
-        return {"status": "success", "message": "Спасибо за обратную связь!"}
-    finally:
-        DB_POOL.putconn(conn)
+
+    def _work():
+        conn = DB_POOL.getconn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO user_actions
+                        (action_type, session_id, user_domain, computer_name, metadata, created_at)
+                        VALUES ('feedback_inaccuracy', %s, %s, %s, %s, NOW())
+                    """, (
+                        user.get("computer_name"),
+                        user.get("domain"),
+                        user.get("computer_name"),
+                        json.dumps(payload.dict(), ensure_ascii=False)
+                    ))
+        finally:
+            DB_POOL.putconn(conn)
+
+    await run_in_threadpool(_work)
+    return {"status": "success", "message": "Спасибо за обратную связь!"}
 
 
 @app.post("/api/upload")
@@ -214,39 +261,142 @@ async def api_upload(
 ):
     user = get_user_identifiers(request)
 
-    # сохраняем файл в DOCS_ROOT
-    DOCS_ROOT.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", (file.filename or "upload"))
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    final_name = f"{ts}_{safe_name}"
-    dest_path = DOCS_ROOT / final_name
-    content = await file.read()
-    with dest_path.open("wb") as f:
-        f.write(content)
+    # имя/расширение
+    orig_name = file.filename or "upload"
+    ext = Path(orig_name).suffix.lower()
 
-    # логируем действие
-    conn = DB_POOL.getconn()
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(400, "Недопустимый тип файла")
+
+    # быстрый пробник для type sniff (и чтоб не тянуть весь файл в память)
+    PROBE_BYTES = 8192
+    head = await file.read(PROBE_BYTES)
+    if not head:
+        raise HTTPException(400, "Пустой файл")
+
+    if _HAVE_MAGIC:
+        sniffed = magic.from_buffer(head, mime=True) or ""
+        allowed = ALLOWED_MIME_BY_EXT.get(ext, set())
+        if allowed and sniffed not in allowed:
+            if not (ext == ".docx" and sniffed == "application/zip"):
+                raise HTTPException(400, f"Неверный тип содержимого: {sniffed}")
+
+    # генерим безопасное имя и путь (НЕ DOCS_ROOT)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(orig_name).stem)
+    final_name = f"{datetime.now():%Y%m%d_%H%M%S}_{safe_stem}_{token_urlsafe(6)}{ext}"
+    dest_path = UPLOADS_ROOT / final_name
+    UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # стриминговая запись + контроль MAX_SIZE
+    CHUNK = 1 << 20  # 1 MiB
+    written = 0
     try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO user_actions
-                    (action_type, session_id, user_domain, computer_name, metadata, created_at)
-                    VALUES ('file_upload', %s, %s, %s, %s, NOW())
-                """, (
-                    user.get("computer_name"),
-                    user.get("domain"),
-                    user.get("computer_name"),
-                    json.dumps({"filename": final_name, "comment": comment}, ensure_ascii=False)
-                ))
-        return {
-            "status": "success",
-            "message": "Файл загружен",
-            "filename": final_name,
-            "url": f"/docs/{final_name}",
-        }
-    finally:
-        DB_POOL.putconn(conn)
+        if _HAVE_AIOFILES:
+            import aiofiles
+            async with aiofiles.open(dest_path, "wb") as out:
+                await out.write(head)
+                written += len(head)
+                if written > MAX_SIZE:
+                    raise HTTPException(413, "Файл слишком большой")
+                while True:
+                    chunk = await file.read(CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_SIZE:
+                        raise HTTPException(413, "Файл слишком большой")
+                    await out.write(chunk)
+        else:
+            # без aiofiles — пишем синхронно, но уводим в threadpool
+            def _write_sync(src_file, path, head_bytes, max_size, chunk_size):
+                with open(path, "wb") as out:
+                    out.write(head_bytes)
+                    total = len(head_bytes)
+                    while True:
+                        chunk = src_file.read(chunk_size)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_size:
+                            raise HTTPException(413, "Файл слишком большой")
+                        out.write(chunk)
+
+            # используем низкоуровневый файловый объект, указатель уже после head
+            await run_in_threadpool(
+                _write_sync, file.file, dest_path, head, MAX_SIZE, CHUNK
+            )
+            written = os.path.getsize(dest_path)
+    except HTTPException:
+        # удалим частично записанный файл
+        with contextlib.suppress(Exception):
+            try:
+                dest_path.unlink(missing_ok=True)   # Py3.8+
+            except TypeError:
+                if dest_path.exists():               # фоллбек для более старых Python
+                    dest_path.unlink()
+        raise
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            try:
+                dest_path.unlink(missing_ok=True)
+            except TypeError:
+                if dest_path.exists():
+                    dest_path.unlink()
+        raise HTTPException(500, f"Ошибка сохранения файла: {e}")
+
+
+    # лог в БД — через threadpool (psycopg2 блокирующий)
+    def _log_upload():
+        conn = DB_POOL.getconn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO user_actions
+                        (action_type, session_id, user_domain, computer_name, metadata, created_at)
+                        VALUES ('file_upload', %s, %s, %s, %s, NOW())
+                    """, (
+                        user.get("computer_name"),
+                        user.get("domain"),
+                        user.get("computer_name"),
+                        json.dumps({"filename": final_name,
+                                    "comment": comment,
+                                    "size": written}, ensure_ascii=False)
+                    ))
+        finally:
+            DB_POOL.putconn(conn)
+
+    await run_in_threadpool(_log_upload)
+
+    return {
+        "status": "success",
+        "message": "Файл загружен",
+        "filename": final_name,
+        "url": f"/files/{final_name}",
+    }
+
+
+
+# --- скачивание ---
+@app.get("/files/{filename}")
+async def serve_uploaded_file(filename: str):
+    # жёсткая валидация имени: только наши сгенерированные символы
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
+        raise HTTPException(400, "Некорректное имя файла")
+
+    path = UPLOADS_ROOT / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "Файл не найден")
+
+    # определяем MIME «лучшим предположением», но не даём браузеру нюхать тип
+    mime, _ = mimetypes.guess_type(str(path))
+    disp = "inline" if (mime and (mime.startswith("text/") or mime=="application/pdf")) else "attachment"
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'{disp}; filename="{filename}"',
+    }
+    return FileResponse(path, media_type=mime or "application/octet-stream", headers=headers)
+
 
 
 @app.post("/api/clear-chat")
@@ -256,169 +406,62 @@ async def clear_chat_history(
 ):
     """Скрытие истории чата (установка isHide=true)"""
     try:
-        # Получаем данные запроса
         data = await request.json()
         session_id = data.get('session_id')
-        
         if not session_id:
             raise HTTPException(status_code=400, detail="Session ID required")
-        
+
         user_info = get_user_identifiers(request)
-        
-        # Обновляем записи в базе данных
-        conn = DB_POOL.getconn()
-        try:
-            with conn.cursor() as cur:
-                # Скрываем сообщения
-                cur.execute("""
-                    UPDATE qa_logs
-                    SET isHide = TRUE
-                    WHERE session_id = %s
-                    AND (isHide IS NULL OR isHide = FALSE)
-                """, (session_id,))
-                hidden_count = cur.rowcount  # ← сколько строк обновлено
 
-                # Логируем действие
-                cur.execute("""
-                    INSERT INTO user_actions
-                        (action_type, session_id, user_domain, computer_name, metadata, created_at)
-                    VALUES
-                        ('clear_chat', %s, %s, %s, %s, NOW())
-                """, (
-                    session_id,
-                    user_info['domain'],
-                    user_info['computer_name'],
-                    json.dumps({'hidden_count': hidden_count})
-                ))
+        def _work():
+            conn = DB_POOL.getconn()
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE qa_logs
+                               SET isHide = TRUE
+                             WHERE session_id = %s
+                               AND (isHide IS NULL OR isHide = FALSE)
+                        """, (session_id,))
+                        hidden_count = cur.rowcount
 
-                conn.commit()
+                        cur.execute("""
+                            INSERT INTO user_actions
+                                (action_type, session_id, user_domain, computer_name, metadata, created_at)
+                            VALUES
+                                ('clear_chat', %s, %s, %s, %s, NOW())
+                        """, (
+                            session_id,
+                            user_info['domain'],
+                            user_info['computer_name'],
+                            json.dumps({'hidden_count': hidden_count})
+                        ))
+                        return hidden_count
+            finally:
+                DB_POOL.putconn(conn)
 
-                
-                logger.info(f"Chat history cleared for session {session_id}: {hidden_count} messages hidden")
-                
-                # Очищаем сессию в памяти
-                if session_id in session_manager.sessions:
-                    session_manager.clear(session_id)
-                
-                return {
-                    "status": "success",
-                    "message": f"История чата очищена ({hidden_count} сообщений)",
-                    "hidden_count": hidden_count
-                }
-                
-        finally:
-            DB_POOL.putconn(conn)
-            
+        hidden_count = await run_in_threadpool(_work)
+
+        logger.info("Chat history cleared for session %s: %d messages hidden",
+                    session_id, hidden_count)
+
+        # очищаем сессию в памяти (вне threadpool)
+        if session_id in session_manager.sessions:
+            session_manager.clear(session_id)
+
+        return {
+            "status": "success",
+            "message": f"История чата очищена ({hidden_count} сообщений)",
+            "hidden_count": hidden_count
+        }
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error clearing chat history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/user/history")
-async def user_history(request: Request, limit: int = 50, include_hidden: bool = False):
-    """Получение истории пользователя (по умолчанию без скрытых)"""
-    user = get_user_identifiers(request)
-    
-    conn = DB_POOL.getconn()
-    try:
-        with conn.cursor() as cur:
-            # Добавляем фильтр по isHide
-            hide_filter = "" if include_hidden else "AND (isHide IS NULL OR isHide = false)"
-            
-            query = f"""
-                SELECT 
-                    id,
-                    question,
-                    answer,
-                    created_at as timestamp,
-                    confidence_score as confidence,
-                    grounding_score,
-                    question_type,
-                    feedback_rating as rating,
-                    citations,
-                    chunks,
-                    processing_time,
-                    isHide
-                FROM qa_logs
-                WHERE session_id = %s
-                {hide_filter}
-                ORDER BY created_at DESC
-                LIMIT %s
-            """
-            
-            # Используем computer_name как session_id
-            cur.execute(query, (user['computer_name'], limit))
-            
-            rows = cur.fetchall()
-            history = []
-            
-            for row in rows:
-                history.append({
-                    'id': row[0],
-                    'question': row[1],
-                    'answer': row[2],
-                    'timestamp': row[3].isoformat() if row[3] else None,
-                    'confidence': row[4],
-                    'grounding_score': row[5],
-                    'question_type': row[6],
-                    'rating': row[7],
-                    'citations': row[8] if row[8] else [],
-                    'chunks': row[9] if row[9] else [],
-                    'processing_time': row[10],
-                    'is_hidden': row[11] if row[11] is not None else False
-                })
-            
-            return {
-                "user": user,
-                "history": history,
-                "total": len(history),
-                "include_hidden": include_hidden
-            }
-            
-    finally:
-        DB_POOL.putconn(conn)
-
-# Обновляем метод в EnhancedAnalytics для учета isHide
-class EnhancedAnalytics(EnhancedAnalytics):  # Наследуем от существующего класса
-    
-    def get_user_history(self, domain: str, computer_name: str, limit: int = 50, include_hidden: bool = False):
-        """Получение истории с учетом скрытых записей"""
-        conn = DB_POOL.getconn()
-        try:
-            with conn.cursor() as cur:
-                hide_filter = "" if include_hidden else "AND (isHide IS NULL OR isHide = false)"
-                
-                # Используем session_id вместо domain/computer_name если они совпадают
-                cur.execute(f"""
-                    SELECT 
-                        question,
-                        answer,
-                        created_at,
-                        confidence_score,
-                        grounding_score,
-                        feedback_rating,
-                        citations
-                    FROM qa_logs
-                    WHERE session_id = %s
-                    {hide_filter}
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (computer_name, limit))
-                
-                rows = cur.fetchall()
-                return [{
-                    'question': row[0],
-                    'answer': row[1],
-                    'timestamp': row[2].isoformat() if row[2] else None,
-                    'confidence': row[3],
-                    'grounding_score': row[4],
-                    'rating': row[5],
-                    'citations': row[6] if row[6] else []
-                } for row in rows]
-                
-        finally:
-            DB_POOL.putconn(conn)
 
 @app.get("/resolve")
 def resolve_doc(book: str, page: Optional[int] = None):
@@ -429,7 +472,7 @@ def resolve_doc(book: str, page: Optional[int] = None):
     rel = _BOOK_PATH_CACHE.get(safe_book)
     if not rel or not (DOCS_ROOT / rel).exists():
         # 2) ищем на диске
-        exts = [".pdf", ".docx", ".doc", ".md", ".txt", ".rtf"]
+        exts = [".pdf", ".docx", ".md", ".txt", ".xlsx"]
         candidates = []
         for ext in exts:
             for p in DOCS_ROOT.rglob(safe_book + ext):
@@ -461,6 +504,14 @@ def resolve_doc(book: str, page: Optional[int] = None):
         url += f"#page={page}"
     return RedirectResponse(url, status_code=307)
 
+@app.on_event("shutdown")
+def _close_pool():
+    try:
+        DB_POOL.closeall()
+        logger.info("DB pool closed")
+    except Exception:
+        logger.exception("Failed to close DB pool")
+
 @app.middleware("http")
 async def human_access_log(request: Request, call_next):
     path = unquote(request.url.path)                         # /suggestions
@@ -470,12 +521,12 @@ async def human_access_log(request: Request, call_next):
         full = f"{path}?{q}"
     else:
         full = path
-    logger.info('GET %s', full)                              # → Понятный текст
+    logger.info('%s %s', request.method, full)                            # → Понятный текст
     resp = await call_next(request)
-    logger.info('-> %d %s', resp.status_code, full)
+    logger.info('-> %d %s %s', resp.status_code, request.method, full)
     return resp
 
-# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Инициализация компонентов с передачей searcher
+# Инициализация компонентов с передачей searcher
 DB_DSN = "dbname=rag user=rag password=rag host=127.0.0.1 port=5432"
 searcher = AdvancedHybridSearch(DB_DSN)
 chat_engine = EnhancedRAGChat(searcher)  # Передаем searcher в chat!
@@ -483,22 +534,26 @@ chat_engine = EnhancedRAGChat(searcher)  # Передаем searcher в chat!
 # Кэш для оптимизации
 class ResponseCache:
     def __init__(self, ttl_seconds: int = 3600):
+        from threading import RLock
         self.cache = {}
         self.timestamps = {}
         self.ttl = ttl_seconds
+        self._lock = RLock()
     
     def get(self, key: str) -> Optional[Any]:
-        if key in self.cache:
-            if datetime.now() - self.timestamps[key] < timedelta(seconds=self.ttl):
-                return self.cache[key]
-            else:
-                del self.cache[key]
-                del self.timestamps[key]
+        with self._lock:
+            if key in self.cache:
+                if datetime.now() - self.timestamps[key] < timedelta(seconds=self.ttl):
+                    return self.cache[key]
+                else:
+                    del self.cache[key]
+                    del self.timestamps[key]
         return None
     
     def set(self, key: str, value: Any):
-        self.cache[key] = value
-        self.timestamps[key] = datetime.now()
+        with self._lock:
+            self.cache[key] = value
+            self.timestamps[key] = datetime.now()
     
     def clear(self):
         self.cache.clear()
@@ -547,32 +602,174 @@ class FeedbackRequest(BaseModel):
     qa_id: Optional[str] = None
     
 # менеджер сессий с передачей searcher
+# менеджер сессий с передачей searcher
 class SessionManager:
-    def __init__(self, searcher: AdvancedHybridSearch):
-        self.sessions = {}
-        self.searcher = searcher
-        self.state = {}
-    
-    def get_or_create(self, session_id: str) -> EnhancedRAGChat:
-        if session_id not in self.sessions:
-            self.sessions[session_id] = EnhancedRAGChat(self.searcher)  # Передаем searcher!
-        return self.sessions[session_id]
-    
-    def clear(self, session_id: str):
-        if session_id in self.sessions:
-            self.sessions[session_id].clear_history()
-        self.state.pop(session_id, None)
+    def __init__(self, searcher: AdvancedHybridSearch, *,
+                 ttl_sec: int | None = None,
+                 max_sessions: int | None = None):
+        from threading import RLock
 
-     # --- фиксация последней темы для авто-разрыва ---
+        self.searcher = searcher
+        self.sessions: dict[str, EnhancedRAGChat] = {}
+        self.state: dict[str, dict] = {}
+        self.last_used: dict[str, datetime] = {}
+
+        self.ttl_sec = int(ttl_sec or SESSIONS_TTL_SEC)
+        self.max_sessions = int(max_sessions or SESSIONS_MAX)
+        self._lock = RLock()
+
+        logger.info(
+            "SessionManager initialized (TTL=%s sec, MAX=%s)",
+            self.ttl_sec, self.max_sessions
+        )
+    @staticmethod
+    def _brief_chunks(chunks: list[dict], limit: int = 3) -> list[dict]:
+        brief = []
+        for c in (chunks or [])[:limit]:
+            brief.append({
+                "book": c.get("book"),
+                "section": c.get("section") or c.get("meta", {}).get("section_title") or c.get("parent_title"),
+                "page": c.get("page"),
+                "score": c.get("score"),
+            })
+        return brief
+
+    def build_context_query(self, session_id: str, current_q: str) -> str | None:
+        prev = self.state.get(session_id)
+        if not prev:
+            return None
+
+        cur_tok  = _tokens(current_q)
+        prev_tok = prev.get('qtok') or set()
+        last_q   = prev.get('last_q') or ""
+        book     = prev.get('book')
+        brief    = prev.get('brief') or []
+
+        # короткие уточняющие реплики — просто сцепляем
+        if len(cur_tok) < 3:
+            base = f"{last_q}. {current_q}".strip()
+        else:
+            union_tokens = sorted((cur_tok | prev_tok))
+            base = f"{last_q}. {current_q}. " + " ".join(union_tokens)
+
+        if book:
+            base += f" {book}"
+        for b in brief[:2]:
+            sec = (b or {}).get('section')
+            if sec:
+                base += f" {sec}"
+
+        return base.strip()
+    
+    def _prune(self, now: datetime | None = None):
+        """
+        Оппортунистическая очистка:
+          1) Удаляет сессии с истёкшим TTL (если TTL > 0).
+          2) Если активных сессий > лимита — удаляет LRU сверх лимита.
+        Перед удалением обязательно вызывает clear_history() у чатов.
+        """
+        with self._lock:
+            if not self.sessions:
+                return
+
+            now = now or datetime.now()
+            to_remove: list[str] = []
+
+            # 1) TTL
+            if self.ttl_sec > 0:
+                ttl_delta = timedelta(seconds=self.ttl_sec)
+                for sid, ts in list(self.last_used.items()):
+                    if now - ts > ttl_delta:
+                        to_remove.append(sid)
+
+            # Применяем TTL-очистку
+            removed_ttl = 0
+            for sid in to_remove:
+                chat = self.sessions.pop(sid, None)
+                if chat is not None:
+                    try:
+                        chat.clear_history()
+                    except Exception:
+                        logger.debug("clear_history() failed for %s", sid, exc_info=True)
+                self.last_used.pop(sid, None)
+                self.state.pop(sid, None)
+                removed_ttl += 1
+
+            if removed_ttl:
+                logger.info("SessionManager prune(TTL): removed=%d, alive=%d",
+                            removed_ttl, len(self.sessions))
+
+            # 2) Лимит (LRU)
+            if self.max_sessions > 0 and len(self.sessions) > self.max_sessions:
+                # отсортируем по last_used (старые раньше)
+                # берём только оставшиеся живые SID
+                alive_sids = [sid for sid in self.sessions.keys()]
+                alive_sids.sort(key=lambda sid: self.last_used.get(sid, datetime.min))
+                over = len(self.sessions) - self.max_sessions
+                lru_to_remove = alive_sids[:over]
+
+                removed_lru = 0
+                for sid in lru_to_remove:
+                    chat = self.sessions.pop(sid, None)
+                    if chat is not None:
+                        try:
+                            chat.clear_history()
+                        except Exception:
+                            logger.debug("clear_history() failed for %s", sid, exc_info=True)
+                    self.last_used.pop(sid, None)
+                    self.state.pop(sid, None)
+                    removed_lru += 1
+
+                if removed_lru:
+                    logger.warning(
+                        "SessionManager prune(LRU): removed=%d (over limit), alive=%d, limit=%d",
+                        removed_lru, len(self.sessions), self.max_sessions
+                    )
+
+    def get_or_create(self, session_id: str) -> EnhancedRAGChat:
+        now = datetime.now()
+        with self._lock:
+            # сначала обновляем отметку активности и чистим
+            self.last_used[session_id] = now
+            self._prune(now)
+
+            # создаём чат только после pruning
+            if session_id not in self.sessions:
+                self.sessions[session_id] = EnhancedRAGChat(self.searcher)  # Передаем searcher!
+                logger.debug("SessionManager: created session %s (total=%d)",
+                             session_id, len(self.sessions))
+
+            return self.sessions[session_id]
+
+    def clear(self, session_id: str):
+        """Полный сброс сессии, если пользователь явно просит (ручки /clear-chat, /reset_session)."""
+        with self._lock:
+            chat = self.sessions.pop(session_id, None)
+            if chat is not None:
+                try:
+                    chat.clear_history()
+                except Exception:
+                    logger.debug("clear_history() failed for %s", session_id, exc_info=True)
+            self.state.pop(session_id, None)
+            self.last_used.pop(session_id, None)
+            logger.info("SessionManager: cleared session %s", session_id)
+
+    # --- фиксация последней темы для авто-разрыва ---
     def note(self, session_id: str, q: str, chunks: list[dict]):
-        """Запомнить токены вопроса и первую книгу (book) из найденных чанков."""
+        """Запомнить токены вопроса, первую книгу, ПОСЛЕДНИЙ вопрос и краткую сводку чанков."""
         try:
-            qtok = _tokens(q)  # используем уже определённый выше helper
+            qtok = _tokens(q)
             main_book = chunks[0].get('book') if chunks else None
-            self.state[session_id] = {'qtok': qtok, 'book': main_book, 'last_cut_at': None}
+            self.state[session_id] = {
+                'qtok': qtok,
+                'book': main_book,
+                'last_q': q,
+                'brief': self._brief_chunks(chunks),
+                'last_cut_at': None
+            }
         except Exception:
             pass
- 
+
     def is_topic_shift(self, session_id: str, q: str, chunks: list[dict]) -> bool:
         """
         Сильный дрейф темы = изменилась книга и слабое пересечение с прошлым вопросом.
@@ -588,7 +785,6 @@ class SessionManager:
         changed_book = bool(prev.get('book') and book_now and book_now != prev['book'])
         if not (changed_book and overlap < 0.25):
             return False
-        # анти-дребезг: если только что уже рвали — пропустим в течение 60с
         last_cut = prev.get('last_cut_at')
         now = datetime.now()
         if last_cut and (now - last_cut).total_seconds() < 60:
@@ -596,7 +792,10 @@ class SessionManager:
         prev['last_cut_at'] = now
         return True
 
-session_manager = SessionManager(searcher)  # Передаем searcher в менеджер
+
+SESSIONS_TTL_SEC = int(os.getenv("CHATS_TTL_SEC", os.getenv("SESSIONS_TTL_SEC", "3600")))  # по умолчанию 1 час
+SESSIONS_MAX     = int(os.getenv("CHATS_MAX",     os.getenv("SESSIONS_MAX",     "500")))   # по умолчанию 500
+session_manager = SessionManager(searcher, ttl_sec=SESSIONS_TTL_SEC, max_sessions=SESSIONS_MAX)  # Передаем searcher в менеджер
 
 def calculate_confidence(chunks: List[Dict], answer: str, grounding_score: float = None) -> float:
     """Расчет уверенности с учетом grounding"""
@@ -848,6 +1047,30 @@ def ask_question(
             min_score=ms,    
         )
 
+        # Нужно ли пробовать контекстный фолбэк?
+        need_ctx_retry = (not chunks) or (len(_tokens(question.text)) < 3) \
+                         or (not is_in_kb_domain(question.text, chunks, debug=True))
+
+        # --- Контекстный фолбэк: достраиваем запрос из прошлого шага и ищем ещё раз ---
+        if need_ctx_retry and question.conversation_id:
+            ctx_q = session_manager.build_context_query(question.conversation_id, question.text)
+            if ctx_q:
+                try:
+                    chunks2 = searcher.search(
+                        ctx_q,
+                        top_k=question.top_k,
+                        search_methods=question.search_methods,
+                        use_query_expansion=True,
+                        context_window=1,
+                        min_score=max(0.12, ms * 0.8),  # немного смягчаем для уточнений
+                    )
+                    if chunks2:
+                        chunks = chunks2
+                        logger.info("Contextual retry used for session %s", question.conversation_id)
+                except Exception:
+                    logger.debug("Contextual retry failed", exc_info=True)
+
+        # --- теперь проверяем домен/чувствительность ---
         if not is_in_kb_domain(question.text, chunks) or detect_sensitive_reason(question.text):
             return Answer(
                 answer=("Я отвечаю по внутренней базе знаний (инструкции Falcon). "
@@ -1082,10 +1305,32 @@ def get_user_identifiers(request: Optional[Request]) -> Dict:
 
 
 @app.get("/user/history")
-async def user_history(request: Request, limit: int = 50):
+async def user_history(
+    request: Request,
+    limit: int = 50,
+    include_hidden: bool = False,
+    by: str = "session",  # 'session' | 'user'
+):
+    """
+    История пользователя. По умолчанию:
+      - by='session' (история по session_id = X-Computer-Name),
+      - include_hidden=False (не показываем скрытые).
+    """
     user = get_user_identifiers(request)
-    hist = analytics.get_user_history(user['domain'], user['computer_name'], limit)
-    return {"user": user, "history": hist, "total": len(hist)}
+    hist = analytics.get_user_history(
+        domain=user['domain'],
+        computer_name=user['computer_name'],
+        limit=limit,
+        include_hidden=include_hidden,
+        by=by,
+    )
+    return {
+        "user": user,
+        "history": hist,
+        "total": len(hist),
+        "include_hidden": include_hidden,
+        "by": by,
+    }
 
 @app.post("/search")
 async def search_documents(request: SearchRequest):
@@ -1240,8 +1485,6 @@ async def ws_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
-
-# HTML интерфейс с поддержкой grounding индикатора
 ENHANCED_HTML_INTERFACE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -1250,7 +1493,6 @@ ENHANCED_HTML_INTERFACE = """
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
     <link rel="icon" href="/favicon.ico" sizes="any"/>
     <title>Falcon AI Assistant</title>
-    <style>
 <style>
     * {
         margin: 0;
@@ -2419,12 +2661,30 @@ img.doc-img {
                 border-radius: 0;
             }
         }
+ 
+details.low-confidence > summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  margin: -4px 0 12px 0;
+  background: #FFF7ED;
+  color: #7B341E;
+  border-left: 4px solid var(--warning);
+  border-radius: 6px;
+  list-style: none;
+}
+details.low-confidence > summary::-webkit-details-marker { display: none; }
+details.low-confidence[open] > summary { margin-bottom: 12px; }
+ 
+body.dark-theme details.low-confidence > summary {
+  background: rgba(237, 137, 54, 0.15);
+  color: #F6E05E;
+}
+
     </style>
-    <script src="/js/marked.min.js"></script>
-    <script src="/js/purify.min.js"></script>
+    <script src="/js/marked.min.js" defer></script>
+    <script src="/js/purify.min.js" defer></script>
 </head>
 <body>
-    <!-- Плавающее меню -->
     <div class="floating-menu">
         <div class="menu-dropdown">
             <button class="menu-item" onclick="toggleFeedbackModal()">
@@ -2451,8 +2711,7 @@ img.doc-img {
             ⚙️
         </button>
     </div>
-    
-    <!-- Модальное окно подтверждения -->
+
     <div class="confirm-modal" id="confirmModal">
         <div class="confirm-box">
             <div class="confirm-title">Очистить историю чата?</div>
@@ -2464,24 +2723,22 @@ img.doc-img {
         </div>
     </div>
     
-    <!-- Модальное окно обучения (из оригинала) -->
     <div class="modal-overlay" id="feedbackModal">
         <div class="modal">
             <h2>Обучение и обратная связь</h2>
             
             <div class="modal-tabs">
-                <button class="modal-tab active" onclick="switchTab('training')">
+                <button class="modal-tab active" onclick="switchTab('training', event)">
                     📚 Добавить материалы
                 </button>
-                <button class="modal-tab" onclick="switchTab('inaccuracy')">
+                <button class="modal-tab" onclick="switchTab('inaccuracy', event)">
                     ⚠️ Сообщить о неточности
                 </button>
-                <button class="modal-tab" onclick="switchTab('file')">
+                <button class="modal-tab" onclick="switchTab('file', event)">
                     📎 Загрузить файл
                 </button>
             </div>
-            
-            <!-- Вкладка добавления материалов -->
+
             <div class="modal-content active" id="training-tab">
                 <form onsubmit="submitTrainingData(event)">
                     <div class="form-group">
@@ -2502,8 +2759,7 @@ img.doc-img {
                     </div>
                 </form>
             </div>
-            
-            <!-- Вкладка сообщения о неточности -->
+
             <div class="modal-content" id="inaccuracy-tab">
                 <form onsubmit="submitInaccuracy(event)">
                     <div class="form-group">
@@ -2521,7 +2777,6 @@ img.doc-img {
                 </form>
             </div>
             
-            <!-- Вкладка загрузки файла -->
             <div class="modal-content" id="file-tab">
                 <form onsubmit="submitFile(event)">
                     <div class="form-group">
@@ -2646,13 +2901,9 @@ img.doc-img {
         }
         // Функция получения идентификаторов пользователя
         function getUserIdentifiers() {
-            // Для браузера мы можем получить только базовую информацию
             const identifiers = {
-                // Домен из URL
                 domain: window.location.hostname || 'localhost',
-                // Уникальный ID браузера (сохраняем в localStorage)
                 computer_name: getOrCreateBrowserId(),
-                // Дополнительная информация
                 screen: `${screen.width}x${screen.height}`,
                 platform: navigator.platform,
                 language: navigator.language
@@ -2669,7 +2920,7 @@ img.doc-img {
         window.totalTime  = window.totalTime  ?? 0;
         let suggestions = [];
         
-        // WebSocket для real-time
+        // WebSocket
         let ws = null;
         let reconnectAttempts = 0;
         const MAX_RETRY_MS = 30000;
@@ -2747,48 +2998,57 @@ function extractImagesFromChunks(chunks) {
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message bot-message';
             
-            let html = '<div class="bubble">';
+// ⬇️ удалите всё от `let html = '<div class="bubble">';` до `html += '</div>';`
+// и вставьте этот блок:
 
-            if (data.blocked) {
-            html += `
-                <div style="margin:-4px 0 12px 0;padding:10px 12px;border-left:4px solid #ed8936;background:#FFF7ED;color:#7B341E;border-radius:6px;">
-                Ответ скрыт из-за низкой уверенности.
-                </div>
-            `;
-            }
+let html = '';
 
-            html += renderMarkdownSafe(data.answer);
+// заранее собираем индикаторы (чтобы вставлять и в details, и в обычный div)
+const confScore = data.confidence_score ?? data.confidence;
+let indicators = '';
 
-            // Индикатор уверенности
-            const confScore = data.confidence_score ?? data.confidence;
-            if (confScore !== undefined) {
-                const conf = formatConfidence(confScore);
-                html += `
-                    <div class="confidence-indicator">
-                        <span>Уверенность:</span>
-                        <div class="confidence-bar">
-                            <div class="confidence-fill ${conf.className}" style="width: ${conf.percent}%"></div>
-                        </div>
-                        <span>${conf.percent}%</span>
-                    </div>
-                `;
-            }
-            
-            // Индикатор grounding
-            if (data.grounding_score !== undefined && data.grounding_score !== null) {
-                const ground = formatConfidence(data.grounding_score);
-                html += `
-                    <div class="grounding-indicator">
-                        <span>Подтверждение источниками:</span>
-                        <div class="confidence-bar">
-                            <div class="confidence-fill ${ground.className}" style="width: ${ground.percent}%"></div>
-                        </div>
-                        <span>${ground.percent}%</span>
-                    </div>
-                `;
-            }
-            
-            html += '</div>';
+if (confScore !== undefined) {
+  const conf = formatConfidence(confScore);
+  indicators += `
+    <div class="confidence-indicator">
+      <span>Уверенность:</span>
+      <div class="confidence-bar">
+        <div class="confidence-fill ${conf.className}" style="width: ${conf.percent}%"></div>
+      </div>
+      <span>${conf.percent}%</span>
+    </div>
+  `;
+}
+
+if (data.grounding_score !== undefined && data.grounding_score !== null) {
+  const ground = formatConfidence(data.grounding_score);
+  indicators += `
+    <div class="grounding-indicator">
+      <span>Подтверждение источниками:</span>
+      <div class="confidence-bar">
+        <div class="confidence-fill ${ground.className}" style="width: ${ground.percent}%"></div>
+      </div>
+      <span>${ground.percent}%</span>
+    </div>
+  `;
+}
+
+if (data.blocked) {
+  html += `
+    <details class="bubble low-confidence">
+      <summary>⚠️ Низкая уверенность — показать выдержки</summary>
+      ${renderMarkdownSafe(data.answer)}
+      ${indicators}
+    </details>
+  `;
+} else {
+  html += `
+    <div class="bubble">
+      ${renderMarkdownSafe(data.answer)}
+      ${indicators}
+    </div>
+  `;
+}
 
 const imgs = extractImagesFromChunks(data.chunks);
 if (imgs.length) {
@@ -2814,8 +3074,6 @@ if (imgs.length) {
   `;
 }
 
-            
-// экранирование текста
 function esc(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -2823,13 +3081,12 @@ function esc(s) {
     .replace(/'/g, "&#39;");
 }
 
-// Источники
 if (data.citations && data.citations.length > 0) {
   html += '<div class="citations">';
   html += '<h4>📚 Источники:</h4>';
 
   data.citations.forEach(cit => {
-    const relevance = Math.min(100,(cit.relevance * 100).toFixed(0));
+    const relevance = Math.max(0, Math.min(100, Math.round((Number(cit.relevance) || 0) * 100)));
     const hasPage = Number.isInteger(cit.page) && cit.page > 0;
     const url = `/resolve?book=${encodeURIComponent(cit.book)}${hasPage ? `&page=${cit.page}` : ''}`;
 
@@ -2854,8 +3111,6 @@ if (data.citations && data.citations.length > 0) {
   html += '</div>';
 }
 
-            
-            // Рейтинг
             html += `
                 <div class="rating">
                     ${[1,2,3,4,5].map(i => 
@@ -2874,7 +3129,6 @@ if (data.citations && data.citations.length > 0) {
 
     if (window.DOMPurify) {
       const clean = DOMPurify.sanitize(raw, {
-        // расширяем дефолтные допустимые теги/атрибуты
         ADD_TAGS: ['img'],
         ADD_ATTR: ['src','alt','title','loading','referrerpolicy','width','height','class']
       });
@@ -2886,7 +3140,6 @@ if (data.citations && data.citations.length > 0) {
   }
 
   (function initLightbox() {
-  // оверлей
   const lb = document.createElement('div');
   lb.className = 'lightbox';
   lb.innerHTML = `
@@ -2920,7 +3173,6 @@ if (data.citations && data.citations.length > 0) {
   function closeLB() {
     lb.classList.remove('open');
     document.body.style.overflow = '';
-    // небольшая задержка очистки (чтобы не мигало при быстром закрытии/открытии)
     setTimeout(() => { imgEl.src = ''; }, 150);
   }
   function prevLB() {
@@ -2936,12 +3188,10 @@ if (data.citations && data.citations.length > 0) {
   lb.querySelector('.lb-prev').addEventListener('click', prevLB);
   lb.querySelector('.lb-next').addEventListener('click', nextLB);
 
-  // клик по тёмной подложке — закрыть
   lb.addEventListener('click', (e) => {
     if (e.target === lb) closeLB();
   });
 
-  // клавиатура в открытом режиме
   document.addEventListener('keydown', (e) => {
     if (!lb.classList.contains('open')) return;
     if (e.key === 'Escape')      return closeLB();
@@ -2949,12 +3199,10 @@ if (data.citations && data.citations.length > 0) {
     if (e.key === 'ArrowRight')  return nextLB();
   });
 
-  // Делегирование кликов по превью (работает для всех сообщений)
   document.addEventListener('click', (e) => {
     const clicked = e.target.closest('img.doc-img');
     if (!clicked) return;
 
-    // находим контейнер данной галереи и собираем все её картинки
     const container = clicked.closest('.images-from-chunks');
     if (!container) return;
 
@@ -3127,9 +3375,7 @@ async function loadPopularTopics() {
   }
 }
 
-        
-        // Инициализация
-        document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', () => {
   const welcomeMd = `
 👋 Здравствуйте!
 
@@ -3172,11 +3418,9 @@ async function loadPopularTopics() {
            //  setInterval(loadPopularTopics, 60000);
         });
 
-// Создание или получение уникального ID браузера
 function getOrCreateBrowserId() {
     let browserId = localStorage.getItem('browser_id');
     if (!browserId) {
-        // Генерируем уникальный ID на основе различных параметров
         const fingerprint = [
             navigator.userAgent,
             navigator.language,
@@ -3186,7 +3430,6 @@ function getOrCreateBrowserId() {
             navigator.platform
         ].join('|');
 
-        // Простой хеш для создания ID
         browserId = 'browser_' + btoa(fingerprint)
             .replace(/[^a-zA-Z0-9]/g, '')
             .substring(0, 16);
@@ -3196,7 +3439,7 @@ function getOrCreateBrowserId() {
     return browserId;
 }
 
-// Обновленная функция отправки вопроса с идентификацией
+// функция отправки вопроса
 async function sendQuestionWithAuth() {
     if (isProcessing) return;
 
@@ -3226,7 +3469,7 @@ try {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Accept': 'application/json', // подскажем серверу вернуть JSON
+      'Accept': 'application/json',
       'X-User-Domain': userInfo.domain,
       'X-Computer-Name': userInfo.computer_name,
       'X-User-Meta': JSON.stringify({
@@ -3251,14 +3494,12 @@ try {
   let textBody = null;
 
   if (ctype.includes('application/json')) {
-    // Может бросить, если тело битое — ловим отдельно
     try { data = await response.json(); }
     catch (e) {
       console.error('JSON parse error for /ask:', e);
-      textBody = await response.text(); // сохраним тело для логов/диагностики
+      textBody = await response.text(); 
     }
   } else {
-    // Это типичная ситуация при 502/504/HTML-страницах ошибок
     textBody = await response.text();
   }
 
@@ -3291,7 +3532,6 @@ try {
 
   removeTypingIndicator(loadingId);
 
-  // Защитимся от падения в displayAnswer/updateStats
   try {
     displayAnswer(data);
   } catch (e) {
@@ -3306,12 +3546,10 @@ try {
   window.lastQAId = data.qa_id;
 } catch (error) {
   removeTypingIndicator(loadingId);
-  // Сетевые/скриптовые ошибки сюда
   displayError(`Произошла ошибка: ${(error && error.message) || String(error)}`);
   console.error('Request to /ask failed:', error);
 }
   } finally {
-    // гарантия восстановления UI в любом случае
     removeTypingIndicator(loadingId);
     isProcessing = false;
     btn.disabled = false;
@@ -3319,7 +3557,7 @@ try {
   }
 }
 
-// Обновленная функция WebSocket с идентификацией
+// функция WebSocket с идентификацией
 function connectWebSocketWithAuth() {
     const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
     const userInfo = getUserIdentifiers();
@@ -3338,7 +3576,6 @@ function connectWebSocketWithAuth() {
 
   const armHeartbeat = () => {
     clearTimeout(heartbeatTimer);
-    // шлём ping, если нет ответа — закрываем и переподключаемся
     heartbeatTimer = setTimeout(() => {
       if (ws?.readyState === WebSocket.OPEN) {
         try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
@@ -3377,7 +3614,6 @@ function connectWebSocketWithAuth() {
 
 window.addEventListener('beforeunload', () => { try { ws?.close(); } catch {} });
 
-// Добавляем функцию просмотра истории пользователя
 async function loadUserHistory() {
     const userInfo = getUserIdentifiers();
     
@@ -3399,14 +3635,9 @@ async function loadUserHistory() {
     }
 }
 
-// Функция отображения истории (исправленный порядок + плашка внизу)
 function displayUserHistory(history) {
   const container = document.getElementById('chatContainer');
-
-  // Сносим предыдущий блок истории
   container.querySelectorAll('.history-divider, .history-entry').forEach(el => el.remove());
-
-  // Хронологически: старые → новые (избегаем мутации входного массива)
   const ordered = Array.isArray(history)
     ? history.slice().sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
     : [];
@@ -3428,7 +3659,7 @@ function displayUserHistory(history) {
     qDiv.innerHTML = qHtml;
     frag.appendChild(qDiv);
 
-    // Ответ (превью + полная версия)
+    // Ответ
     const aDiv = document.createElement('div');
     aDiv.className = 'message bot-message history-entry';
 
@@ -3459,7 +3690,7 @@ function displayUserHistory(history) {
     `;
     frag.appendChild(aDiv);
 
-    // Тоггл «Показать полностью / Свернуть»
+    // «Показать полностью / Свернуть»
     const btn = aDiv.querySelector('.toggle-history');
     if (btn) {
       btn.addEventListener('click', () => {
@@ -3481,7 +3712,6 @@ function displayUserHistory(history) {
     }
   });
 
-  // Плашка — ВНИЗУ
   const divider = document.createElement('div');
   divider.className = 'history-divider';
   divider.innerHTML = `
@@ -3493,15 +3723,11 @@ function displayUserHistory(history) {
   frag.appendChild(divider);
 
   container.appendChild(frag);
-
-  // Прокрутка к низу
   container.scrollTop = container.scrollHeight;
 }
 
 
-// Добавляем кнопку загрузки истории в интерфейс
 document.addEventListener('DOMContentLoaded', () => {
-    // Добавляем кнопку в sidebar
     const sidebar = document.querySelector('.sidebar');
     if (sidebar) {
         const historyButton = document.createElement('button');
@@ -3522,13 +3748,8 @@ document.addEventListener('DOMContentLoaded', () => {
         sidebar.appendChild(historyButton);
     }
     
-    // Автоматически загружаем историю при загрузке страницы
     setTimeout(loadUserHistory, 1000);
-    
-    // Заменяем стандартную функцию отправки
     window.sendQuestion = sendQuestionWithAuth;
-    
-    // Обновляем обработчик кнопки
     document.getElementById('sendBtn').removeEventListener('click', sendQuestion);
     document.getElementById('sendBtn').addEventListener('click', sendQuestionWithAuth);
 });
@@ -3561,19 +3782,15 @@ if (typeof window.pywebview !== 'undefined') {
 }
 </script>
     <script>
-        // Функции для модального окна
         function toggleFeedbackModal() {
             const modal = document.getElementById('feedbackModal');
             modal.classList.toggle('active');
-            
-            // Сброс формы при закрытии
             if (!modal.classList.contains('active')) {
                 resetForms();
             }
         }
         
-        function switchTab(tabName) {
-            // Переключение вкладок
+        function switchTab(tabName, ev) {
             document.querySelectorAll('.modal-tab').forEach(tab => {
                 tab.classList.remove('active');
             });
@@ -3581,7 +3798,7 @@ if (typeof window.pywebview !== 'undefined') {
                 content.classList.remove('active');
             });
             
-            event.target.classList.add('active');
+            (ev?.currentTarget)?.classList.add('active');
             document.getElementById(`${tabName}-tab`).classList.add('active');
         }
         
@@ -3694,7 +3911,6 @@ if (typeof window.pywebview !== 'undefined') {
             `;
         }
         
-        // Закрытие модального окна при клике на оверлей
         document.getElementById('feedbackModal').addEventListener('click', function(event) {
             if (event.target === this) {
                 toggleFeedbackModal();
@@ -3702,7 +3918,6 @@ if (typeof window.pywebview !== 'undefined') {
         });
     </script>
     <script>
-        // Функция переключения темы
         function toggleTheme() {
             const isDark = document.getElementById('themeToggle').checked;
             if (isDark) {
@@ -3713,8 +3928,6 @@ if (typeof window.pywebview !== 'undefined') {
                 localStorage.setItem('theme', 'light');
             }
         }
-        
-        // Загрузка сохраненной темы
         document.addEventListener('DOMContentLoaded', () => {
             const savedTheme = localStorage.getItem('theme');
             if (savedTheme === 'dark') {
@@ -3722,8 +3935,6 @@ if (typeof window.pywebview !== 'undefined') {
                 document.getElementById('themeToggle').checked = true;
             }
         });
-        
-        // Функции для очистки чата
         function confirmClearChat() {
             document.getElementById('confirmModal').classList.add('active');
         }
@@ -3748,7 +3959,6 @@ if (typeof window.pywebview !== 'undefined') {
                 });
                 
                 if (response.ok) {
-                    // Очищаем UI
                     const chatContainer = document.getElementById('chatContainer');
                     chatContainer.innerHTML = `
                         <div class="bot-message message">
@@ -3756,7 +3966,6 @@ if (typeof window.pywebview !== 'undefined') {
                         </div>
                     `;
                     
-                    // Восстанавливаем приветственное сообщение
                     const welcomeMd = `
 👋 Здравствуйте!
 
@@ -3771,8 +3980,6 @@ if (typeof window.pywebview !== 'undefined') {
                     `.trim();
                     
                     document.getElementById('welcome').innerHTML = renderMarkdownSafe(welcomeMd);
-                    
-                    // Сбрасываем статистику
                     window.queryCount = 0;
                     window.totalTime = 0;
                     document.getElementById('queryCount').textContent = '0 запросов';
@@ -3787,9 +3994,6 @@ if (typeof window.pywebview !== 'undefined') {
                 alert('Произошла ошибка при очистке чата');
             }
         }
-        
-        // Весь остальной JavaScript из оригинального кода...
-        // [Здесь должен быть весь JavaScript из оригинала]
     </script>
 </body>
 </html>

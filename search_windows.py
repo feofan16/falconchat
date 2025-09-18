@@ -191,7 +191,7 @@ class AdvancedHybridSearch:
                     use_fp16=False  # Для CPU ставим False, для GPU можно True
                 )
                 self.use_reranking = True
-                logger.info("✓ BGE-reranker v2-m3 загружен (отличная поддержка русского)")
+                logger.info("✓ BGE-reranker v2-m3 загружен")
             except Exception as e:
                 self.reranker = None
                 self.use_reranking = False

@@ -1,4 +1,4 @@
-# enhanced_analytics.py - Добавить в app.py вместо старого класса UsageAnalytics
+# C:\F-ChatAI\enhanced_analytics.py  
 
 import re
 import json
@@ -407,36 +407,75 @@ class EnhancedAnalytics:
         }
 
     
-    def get_user_history(self, domain: str, computer_name: str, limit: int = 50) -> List[Dict]:
-        """Получение истории пользователя"""
-        user_hash = hashlib.md5(f"{domain}_{computer_name}".encode()).hexdigest()
-        
+    def get_user_history(
+        self,
+        domain: str,
+        computer_name: str,
+        limit: int = 50,
+        include_hidden: bool = False,
+        by: str = "session",  # 'session' | 'user'
+    ) -> List[Dict]:
+        """
+        История пользователя/сессии с учётом скрытых записей.
+
+        by='session' — история по session_id (совпадает с X-Computer-Name/браузерным id),
+        by='user'    — история по user_hash (domain+computer_name → users.id → qa_logs.user_id).
+        """
+        return self._get_user_history(domain, computer_name, limit, include_hidden, by)
+
+    def _get_user_history(
+        self,
+        domain: str,
+        computer_name: str,
+        limit: int = 50,
+        include_hidden: bool = False,
+        by: str = "session",  # 'session' | 'user'
+    ) -> List[Dict]:
+        hide_filter = "" if include_hidden else "AND (isHide IS NULL OR isHide = false)"
         conn = self.db_pool.getconn()
         try:
             with conn, conn.cursor() as cur:
-                cur.execute("""
-                    SELECT 
-                        q.created_at, q.question, q.answer, 
-                        q.confidence_score, q.grounding_score,
-                        q.feedback_rating, q.processing_time
-                    FROM qa_logs q
-                    JOIN users u ON q.user_id = u.id
-                    WHERE u.user_hash = %s
-                    ORDER BY q.created_at DESC
-                    LIMIT %s
-                """, (user_hash, limit))
-                
+                if by == "user":
+                    user_hash = hashlib.md5(f"{domain}_{computer_name}".encode()).hexdigest()
+                    cur.execute(f"""
+                        SELECT 
+                            q.created_at, q.question, q.answer, 
+                            q.confidence_score, q.grounding_score,
+                            q.feedback_rating, q.processing_time, q.isHide
+                        FROM qa_logs q
+                        JOIN users u ON q.user_id = u.id
+                        WHERE u.user_hash = %s
+                        {hide_filter}
+                        ORDER BY q.created_at DESC
+                        LIMIT %s
+                    """, (user_hash, limit))
+                else:
+                    # by == 'session' (дефолт) — согласовано с /api/clear-chat
+                    cur.execute(f"""
+                        SELECT 
+                            q.created_at, q.question, q.answer, 
+                            q.confidence_score, q.grounding_score,
+                            q.feedback_rating, q.processing_time, q.isHide
+                        FROM qa_logs q
+                        WHERE q.session_id = %s
+                        {hide_filter}
+                        ORDER BY q.created_at DESC
+                        LIMIT %s
+                    """, (computer_name, limit))
+
+                rows = cur.fetchall()
                 return [
                     {
-                        'timestamp': row[0].isoformat(),
-                        'question': row[1],
-                        'answer': row[2],
-                        'confidence': row[3],
-                        'grounding': row[4],
-                        'rating': row[5],
-                        'time': row[6]
+                        "timestamp": (row[0].isoformat() if row[0] else None),
+                        "question":  row[1],
+                        "answer":    row[2],
+                        "confidence": row[3],
+                        "grounding":  row[4],
+                        "rating":     row[5],
+                        "time":       row[6],
+                        "is_hidden":  bool(row[7]) if row[7] is not None else False,
                     }
-                    for row in cur.fetchall()
+                    for row in rows
                 ]
         finally:
             self.db_pool.putconn(conn)

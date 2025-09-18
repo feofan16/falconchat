@@ -1,7 +1,7 @@
 import re
 import requests
 import sys
-import os
+import os, atexit
 import hashlib
 from typing import List, Dict, Optional, TYPE_CHECKING
 import logging
@@ -12,8 +12,75 @@ import threading
 from contextlib import contextmanager
 if TYPE_CHECKING:
     from search_windows import AdvancedHybridSearch
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_HTTP_SESSION: Optional[requests.Session] = None
+_HTTP_PID = None
+_HTTP_LOCK = threading.Lock()
+
+def _build_retry() -> Retry:
+    # Совместимость с urllib3<1.26 (method_whitelist) и ≥1.26 (allowed_methods)
+    retry_kwargs = dict(
+        total=int(os.getenv("HTTP_RETRY_TOTAL", "3")),
+        connect=int(os.getenv("HTTP_RETRY_CONNECT", "3")),
+        read=int(os.getenv("HTTP_RETRY_READ", "3")),
+        status=int(os.getenv("HTTP_RETRY_STATUS", "3")),
+        backoff_factor=float(os.getenv("HTTP_BACKOFF", "0.25")),
+        status_forcelist=tuple(
+            int(x) for x in os.getenv("HTTP_STATUS_FORCELIST", "408,409,425,429,500,502,503,504")
+                         .split(",") if x.strip()
+        ),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    if hasattr(Retry, "DEFAULT_ALLOWED_METHODS"):
+        retry_kwargs["allowed_methods"] = frozenset(["POST"])
+    else:
+        retry_kwargs["method_whitelist"] = frozenset(["POST"])  # deprecated, но нужно для старых версий
+    return Retry(**retry_kwargs)
+
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    retries = _build_retry()
+    adapter = HTTPAdapter(
+        pool_connections=int(os.getenv("HTTP_POOL_CONN", "50")),  # кол-во пулов (по хостам)
+        pool_maxsize=int(os.getenv("HTTP_POOL_MAX", "50")),       # соединений на хост
+        max_retries=retries,
+        pool_block=True,  # при исчерпании пула ждём, а не «роняем»/создаём лишние сокеты
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    # s.trust_env = False  # при необходимости игнорировать системные прокси
+    return s
+
+def _close_session():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is not None:
+        try:
+            _HTTP_SESSION.close()
+        finally:
+            _HTTP_SESSION = None
+
+atexit.register(_close_session)
+
+def _get_http_session() -> requests.Session:
+    """
+    Thread-safe и process-safe (после fork в новом PID пересоздаём сессию).
+    """
+    global _HTTP_SESSION, _HTTP_PID
+    pid = os.getpid()
+    if _HTTP_SESSION is not None and _HTTP_PID == pid:
+        return _HTTP_SESSION
+
+    with _HTTP_LOCK:
+        if _HTTP_SESSION is None or _HTTP_PID != pid:
+            _close_session()
+            _HTTP_SESSION = _new_session()
+            _HTTP_PID = pid
+        return _HTTP_SESSION
  
-# Исправление кодировки для Windows
+# кодировка для Windows
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
@@ -109,33 +176,43 @@ def timed(log, label: str):
 class PromptTemplate:
     """Шаблоны промптов для разных типов вопросов"""
     
-    SYSTEM_EXPERT = """Ты — экспертный ассистент по технической документации Falcon.
-Твоя задача — предоставлять точные, практичные и хорошо структурированные ответы на основе предоставленных фрагментов документации.
+    SYSTEM_EXPERT = """Предоставляй точные, практичные и структурированные ответы на основе контекста.
+Используй информацию из контекста. Если недостаточно — напиши «⚠️ Без источника:» и дай справку из общих знаний.
+Учитывай взаимосвязи между фрагментами.
+Используй Markdown для форматирования."""
 
-ПРИНЦИПЫ РАБОТЫ:
-1. Точность: Используй ТОЛЬКО информацию из предоставленных фрагментов
-2. Структура: Организуй ответ логично с заголовками и списками
-3. Практичность: Давай конкретные шаги
-4. Честность: Если информации недостаточно, явно об этом сообщи
-5. Контекст: Учитывай взаимосвязи между фрагментами
+    SYSTEM_ANALYTICAL = """Предоставляй точные, практичные и структурированные ответы на основе контекста.
+Используй информацию из контекста. Если информации недостаточно — начав «⚠️ Без источника:» и дай справку из общих знаний.
+Учитывай взаимосвязи между фрагментами контекста.
+Используй Markdown для форматирования."""
 
-ФОРМАТ ОТВЕТА:
-- Используй Markdown для форматирования
-- Начинай с краткого резюме (1-3 предложения)
-- Структурируй основную часть с подзаголовками
-- (Опционально) Завершай практическими рекомендациями или следующими шагами"""
+    CHAIN_OF_THOUGHT = ""
 
-    SYSTEM_ANALYTICAL = """Ты — аналитический помощник, специализирующийся на глубоком анализе технической документации.
-Твоя задача — не просто отвечать на вопросы, но и:
-- Выявлять связи между концепциями
-- Предоставлять контекст и предпосылки
-- Объяснять последствия и зависимости
-- Предупреждать о потенциальных проблемах"""
+    FEW_SHOT_EXAMPLES = ""
 
-    CHAIN_OF_THOUGHT = """Подумай пошагово и проверь себя внутренне, 
-НО выводи только готовый ответ с заголовками, списками, примерами."""
+# Глобально:
+class SimpleRateLimiter:
+    def __init__(self, per_sec: float = 1.0, burst: int = 3):
+        self.per_sec = per_sec; self.burst = burst
+        self._state = {}; self._lock = threading.Lock()
 
-    FEW_SHOT_EXAMPLES = """"""
+    def consume(self, key: str, n: int = 1) -> bool:
+        now = time.time()
+        with self._lock:
+            tokens, last = self._state.get(key, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) * self.per_sec)
+            if tokens >= n:
+                tokens -= n
+                self._state[key] = (tokens, now)
+                return True
+            self._state[key] = (tokens, now)
+            return False
+
+_RATE = SimpleRateLimiter(
+    per_sec=float(os.getenv("RPS_PER_CONV", "1.0")),
+    burst=int(os.getenv("RPS_BURST", "3"))
+)
+
 
 class EnhancedRAGChat:
     """Улучшенная система генерации ответов с проверкой grounding"""
@@ -146,6 +223,7 @@ class EnhancedRAGChat:
         self.context_cache = {}
         self.searcher = searcher  # Сохраняем ссылку на searcher
         self._lock = threading.RLock()
+        self._req_lock = threading.Lock()
 
     def classify_question(self, question: str) -> str:
         """Классификация типа вопроса для выбора оптимальной стратегии"""
@@ -257,6 +335,58 @@ class EnhancedRAGChat:
         if total == 0:
             return 0.0
         return covered / total
+ 
+    def _pack_messages(self, system_prompt: str, user_prompt: str, hist: List[Dict]) -> List[Dict]:
+        # --- параметры (можно настроить через env) ---
+        pred_headroom = int(os.getenv("PROMPT_PRED_HEADROOM", "256"))  # небольшой запас
+        tokens_budget = max(1024, NUM_CTX - NUM_PREDICT - pred_headroom)
+        budget_chars  = int(os.getenv("PROMPT_CHAR_BUDGET", str(tokens_budget * 4)))
+        hard_cap_msgs = int(os.getenv("PROMPT_HARD_CAP_MSGS", "30"))           # максимум сообщений в payload
+        per_msg_cap   = int(os.getenv("PROMPT_PER_MSG_CAP", "8000"))           # максимум символов на одно сообщение
+
+        # --- санация истории ---
+        safe_hist: List[Dict] = []
+        for m in (hist or []):
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            txt = m.get("content", "")
+            if not isinstance(txt, str) or not txt.strip():
+                continue
+            if len(txt) > per_msg_cap:
+                txt = txt[:per_msg_cap]
+            safe_hist.append({"role": role, "content": txt})
+
+        # --- сборка сообщений ---
+        sys_msg = {"role": "system", "content": system_prompt[:per_msg_cap]}
+        user_msg = {"role": "user", "content": user_prompt[:per_msg_cap]}
+
+        msgs: List[Dict] = [sys_msg]
+        if safe_hist:
+            msgs.extend(safe_hist)        # сохраняем хронологию
+        msgs.append(user_msg)
+
+        # --- жёсткий кап по числу сообщений (обрезаем самые старые из истории) ---
+        if len(msgs) > hard_cap_msgs:
+            # оставляем system + (последние hard_cap_msgs-2 из истории) + current_user
+            keep_hist = hard_cap_msgs - 2
+            msgs = [sys_msg] + msgs[1:1+keep_hist] + [user_msg]
+
+        # --- бюджет по символам (подрезаем историю слева; пытаемся снимать парами) ---
+        cur_len = sum(len(m.get("content", "")) for m in msgs)
+        while len(msgs) > 2 and cur_len > budget_chars:
+            # если есть минимум 2 сообщения истории — удаляем самую старую пару
+            if len(msgs) > 3:
+                removed = sum(len(m.get("content", "")) for m in msgs[1:3])
+                del msgs[1:3]
+            else:
+                removed = len(msgs[1].get("content", ""))
+                del msgs[1]
+            cur_len -= removed
+
+        return msgs
+
+
 
     def enhance_context(self, chunks: List[Dict], question: str) -> str:
         """Улучшенная обработка контекста с группировкой и приоритизацией"""
@@ -353,60 +483,11 @@ class EnhancedRAGChat:
         return ""
     
     def build_enhanced_prompt(self, question: str, context: str, q_type: str) -> str:
-        """Построение улучшенного промпта с учетом типа вопроса"""
-        
-        base_prompt = f"""КОНТЕКСТ ИЗ ДОКУМЕНТАЦИИ:
-{context}
-
-ВОПРОС ПОЛЬЗОВАТЕЛЯ: {question}
-
-{self.templates.CHAIN_OF_THOUGHT}
-
-ТВОЙ ОТВЕТ:"""
-        
-        type_instructions = {
-            'howto': """""",
-            
-            'troubleshoot': """
-ФОРМАТ ОТВЕТА ДЛЯ РЕШЕНИЯ ПРОБЛЕМЫ:
-1. Описание проблемы
-2. Возможные причины (от наиболее вероятных)
-3. Диагностика (как проверить каждую причину)
-4. Решения для каждой причины
-5. Профилактика на будущее""",
-            
-            'explain': """
-ФОРМАТ ОТВЕТА ДЛЯ ОБЪЯСНЕНИЯ:
-1. Простое определение (ELI5)
-2. Техническое описание
-3. Ключевые компоненты/аспекты
-4. Примеры использования
-5. Связь с другими концепциями""",
-            
-            'reference': """
-ФОРМАТ ОТВЕТА ДЛЯ СПРАВКИ:
-1. Краткое описание
-2. Таблица/список с параметрами
-3. Описание каждого элемента
-4. Значения по умолчанию
-5. Примеры использования""",
-            
-            'compare': """
-ФОРМАТ ОТВЕТА ДЛЯ СРАВНЕНИЯ:
-1. Краткий вывод
-2. Таблица сравнения
-3. Детальный анализ различий
-4. Рекомендации по выбору
-5. Примеры сценариев использования"""
-        }
-        
-        if q_type in type_instructions:
-            base_prompt = base_prompt.replace(
-                "ТВОЙ ОТВЕТ:",
-                type_instructions[q_type] + "\n\nТВОЙ ОТВЕТ:"
-            )
-        
-        return base_prompt
+        return (
+            f"КОНТЕКСТ:\n{context or '<нет пассов>'}\n\n"
+            f"ВОПРОС:\n{question}\n\n"
+            f"{self.templates.CHAIN_OF_THOUGHT}"
+        )
     
     def post_process_answer(self, answer: str, chunks: List[Dict]) -> str:
         """Постобработка ответа: очистка и форматирование"""
@@ -441,326 +522,347 @@ class EnhancedRAGChat:
         
         return expanded
     
+    def _build_retry_user_prompt(self, question: str, context2: str, q_type: str, prev_answer: str) -> str:
+        base = self.build_enhanced_prompt(question, context2, q_type)
+        prev = self._clean_prev_answer_for_retry(prev_answer)
+        return (
+            f"{base}\n\n"
+            "### Черновик для ревизии\n"
+            "Ниже — твой предыдущий ответ. Проведи ревизию на основе предоставленного контекста:\n"
+            "— Удали или исправь всё, что не подтверждается фрагментами. Если встречается «Подсказка классификатора ОКПД2», считай её гипотезой.\n"
+            "— Добавь недостающие детали, если они есть в контексте.\n"
+            "— Сохрани структуру (резюме → разделы → рекомендации), приведи чёткие шаги.\n"
+            "— Не ссылайся на внешние знания.\n"
+            "— Если информации недостаточно, напиши прямо, какие данные нужны.\n\n"
+            "```markdown\n"
+            f"{prev}\n"
+            "```\n"
+            "Верни только финальную исправленную версию ответа."
+        )
+    
+    def _clean_prev_answer_for_retry(self, s: str) -> str:
+        if not s:
+            return s
+        per_msg_cap = int(os.getenv("PROMPT_PER_MSG_CAP", "8000"))
+        hard_clip = int(os.getenv("RETRY_PREV_ANSWER_CLIP", "2000"))
+        s = re.sub(r"[ \t]+\n", "\n", s).strip()
+        return s[:min(per_msg_cap, hard_clip)]
+    
     def generate_answer(
             self, question: str, top_k: int = None, use_cot: bool = True,
             chunks: Optional[List[Dict]] = None, *, qa_id: Optional[str] = None,
             conversation_id: Optional[str] = None
         ) -> Dict:
         """Принимаем chunks как параметр"""
-        start_time = datetime.now()
-
-        if top_k is None:
-            top_k = MAX_FRAGMENTS
-
-        log = CtxLog(logger, {"qa_id": qa_id, "cid": conversation_id})
-        log.debug(f"generate_answer start: top_k={top_k}, use_cot={use_cot}, chunks_in={len(chunks) if chunks else 0}")
-        
-        # OKPD2: мягкое вычисление подсказки (не влияет на промпт)
-        okpd_hint = None
-        okpd_item = None
-        if OKPD_HINT_ENABLE and _okpd_detect_intent(question):
-            okpd_item = _okpd_extract_item(question)
-            if okpd_item and len(okpd_item) > 255:
-                okpd_item = okpd_item[:255]
-            if classify_factory_item:
-                try:
-                    code, conf, desc, info = classify_factory_item(okpd_item)  # type: ignore
-                    if code and code != "UNSURE":
-                        if okpd_canon:
-                            code = okpd_canon(code) or code  # type: ignore
-                        okpd_hint = {"item": okpd_item, "code": code, "conf": float(conf or 0.0), "desc": desc or "", "info": info or {}}
-                        log.info(f"okpd_hint=True item='{okpd_item}' code={code} conf={conf:.2f}")
-                except Exception as e:
-                    log.warning(f"okpd_hint_classifier_error: {e}")
-        
-        # Классифицируем вопрос
-        q_type = self.classify_question(question)
-        logger.info(f"Тип вопроса: {q_type}")
-        log.info(f"Тип вопроса: {q_type}")
-        
-        # Используем переданные chunks ИЛИ ищем сами
-        if chunks is None:
-            if not self.searcher:
-                logger.error("Нет поискового движка и не переданы chunks")
-                log.error("Нет searcher и не переданы chunks")
+        with self._req_lock:
+            start_time = datetime.now()
+            lim_key = (conversation_id or "global")
+            if not _RATE.consume(lim_key):
                 return {
-                    "answer": "Ошибка конфигурации: отсутствует поисковый движок.",
+                    "answer": "Слишком много запросов подряд. Попробуйте через пару секунд.",
                     "citations": [],
-                    "error": True,
+                    "error": True
+                }
+
+            if top_k is None:
+                top_k = MAX_FRAGMENTS
+
+            log = CtxLog(logger, {"qa_id": qa_id, "cid": conversation_id})
+            log.debug(f"generate_answer start: top_k={top_k}, use_cot={use_cot}, chunks_in={len(chunks) if chunks else 0}")
+            
+            # OKPD2: мягкое вычисление подсказки (не влияет на промпт)
+            okpd_hint = None
+            okpd_item = None
+            if OKPD_HINT_ENABLE and _okpd_detect_intent(question):
+                okpd_item = _okpd_extract_item(question)
+                if okpd_item and len(okpd_item) > 255:
+                    okpd_item = okpd_item[:255]
+                if classify_factory_item:
+                    try:
+                        code, conf, desc, info = classify_factory_item(okpd_item)  # type: ignore
+                        if code and code != "UNSURE":
+                            if okpd_canon:
+                                code = okpd_canon(code) or code  # type: ignore
+                            okpd_hint = {"item": okpd_item, "code": code, "conf": float(conf or 0.0), "desc": desc or "", "info": info or {}}
+                            log.info(f"okpd_hint=True item='{okpd_item}' code={code} conf={conf:.2f}")
+                    except Exception as e:
+                        log.warning(f"okpd_hint_classifier_error: {e}")
+            
+            # Классифицируем вопрос
+            q_type = self.classify_question(question)
+            logger.info(f"Тип вопроса: {q_type}")
+            log.info(f"Тип вопроса: {q_type}")
+            
+            # Используем переданные chunks ИЛИ ищем сами
+            if chunks is None:
+                if not self.searcher:
+                    logger.error("Нет поискового движка и не переданы chunks")
+                    log.error("Нет searcher и не переданы chunks")
+                    return {
+                        "answer": "Ошибка конфигурации: отсутствует поисковый движок.",
+                        "citations": [],
+                        "error": True,
+                        "processing_time": (datetime.now() - start_time).total_seconds()
+                    }
+                
+                # Импортируем здесь чтобы избежать циклической зависимости
+                logger.info("Выполняем поиск через переданный searcher")
+                # ВАЖНО: для поиска добавляем только 'item' (подсказку),
+                #        но НЕ меняем промпт LLM.
+                search_q = f"{question} {okpd_item}" if okpd_item else question
+                # 1-й прогон: обычный гибридный поиск
+                chunks = self.searcher.search(search_q, top_k=top_k, context_window=1)
+                # Smart-retry: если нашли мало — делаем универсальные расширения и повторяем
+                if SMART_RETRY_ENABLE and (not chunks or len(chunks) < SMART_RETRY_MIN_HITS):
+                    q_norm = normalize_for_retrieval(search_q)
+                    exp = build_multiquery_expansions(q_norm)
+                    retry = retrieve_and_rerank(self.searcher, exp, topk_per_query=SMART_RETRY_TOPK_PER_QUERY)
+                    if retry:
+                        chunks = retry[:top_k]
+            else:
+                logger.info(f"Используем переданные chunks: {len(chunks)} фрагментов")
+                log.debug(f"Используем переданные chunks: {len(chunks)}")
+
+            if not chunks:
+                log.warning("Пустые chunks — возвращаем not-found")
+                return {
+                    "answer": "К сожалению, по вашему запросу не найдено релевантной информации в базе знаний.",
+                    "citations": [],
+                    "question_type": q_type,
                     "processing_time": (datetime.now() - start_time).total_seconds()
                 }
             
-            # Импортируем здесь чтобы избежать циклической зависимости
-            logger.info("Выполняем поиск через переданный searcher")
-            # ВАЖНО: для поиска добавляем только 'item' (подсказку),
-            #        но НЕ меняем промпт LLM.
-            search_q = f"{question} {okpd_item}" if okpd_item else question
-            # 1-й прогон: обычный гибридный поиск
-            chunks = self.searcher.search(search_q, top_k=top_k, context_window=1)
-            # Smart-retry: если нашли мало — делаем универсальные расширения и повторяем
-            if SMART_RETRY_ENABLE and (not chunks or len(chunks) < SMART_RETRY_MIN_HITS):
-                q_norm = normalize_for_retrieval(search_q)
-                exp = build_multiquery_expansions(q_norm)
-                retry = retrieve_and_rerank(self.searcher, exp, topk_per_query=SMART_RETRY_TOPK_PER_QUERY)
-                if retry:
-                    chunks = retry[:top_k]
-        else:
-            logger.info(f"Используем переданные chunks: {len(chunks)} фрагментов")
-            log.debug(f"Используем переданные chunks: {len(chunks)}")
+            # Формируем улучшенный контекст
+            context = self.enhance_context(chunks, question)
+            if len(context) > MAX_CONTEXT_CHARS:
+                log.info(f"Context {len(context)} > budget {MAX_CONTEXT_CHARS}, truncate")
+                logger.info("Контекст %d chars > budget %d, подрезаем", len(context), MAX_CONTEXT_CHARS)
+                context = context[:MAX_CONTEXT_CHARS]
+            context_used = context  # «фактически использованный» контекст (после обрезки)
+            log.debug(f"context_size={len(context)}")
 
-        if not chunks:
-            log.warning("Пустые chunks — возвращаем not-found")
-            return {
-                "answer": "К сожалению, по вашему запросу не найдено релевантной информации в базе знаний.",
-                "citations": [],
-                "question_type": q_type,
-                "processing_time": (datetime.now() - start_time).total_seconds()
+            # Выбираем системный промпт
+            system_prompt = (
+                self.templates.SYSTEM_ANALYTICAL 
+                if q_type in ['explain', 'compare'] 
+                else self.templates.SYSTEM_EXPERT
+            )
+            
+            if use_cot:
+                system_prompt += "\n\n" + self.templates.FEW_SHOT_EXAMPLES
+            
+            # Строим промпт (БЕЗ подсказки OKPD!)
+            user_prompt = self.build_enhanced_prompt(question, context, q_type)
+            
+            temp_map = {
+                'reference': 0.3,
+                'compare': 0.4,
+                'howto': 0.4,
+                'troubleshoot': 0.4,
+                'explain': 0.5,
+                'general': 0.45
             }
-        
-        # Формируем улучшенный контекст
-        context = self.enhance_context(chunks, question)
-        if len(context) > MAX_CONTEXT_CHARS:
-            log.info(f"Context {len(context)} > budget {MAX_CONTEXT_CHARS}, truncate")
-            logger.info("Контекст %d chars > budget %d, подрезаем", len(context), MAX_CONTEXT_CHARS)
-            context = context[:MAX_CONTEXT_CHARS]
-        log.debug(f"context_size={len(context)}")
+            temperature = temp_map.get(q_type, 0.45)
+            
+            # 1) Берём историю
+            hist_tail = int(os.getenv("HIST_TAIL_MSGS", "12"))  
+            with self._lock:
+                hist = list(self.conversation_history[-hist_tail:])
 
-        # Выбираем системный промпт
-        system_prompt = (
-            self.templates.SYSTEM_ANALYTICAL 
-            if q_type in ['explain', 'compare'] 
-            else self.templates.SYSTEM_EXPERT
-        )
-        
-        if use_cot:
-            system_prompt += "\n\n" + self.templates.FEW_SHOT_EXAMPLES
-        
-        # Строим промпт (БЕЗ подсказки OKPD!)
-        user_prompt = self.build_enhanced_prompt(question, context, q_type)
-        
-        temp_map = {
-            'reference': 0.3,
-            'compare': 0.4,
-            'howto': 0.4,
-            'troubleshoot': 0.4,
-            'explain': 0.5,
-            'general': 0.45
-        }
-        temperature = temp_map.get(q_type, 0.45)
-        
-        # Формируем запрос к LLM с параметром keep_alive
-        payload = {
-            "model": MODEL,
-            "stream": False,
-            "keep_alive": KEEP_ALIVE,
-            "options": {
-                "num_ctx": NUM_CTX,
-                "temperature": temperature,
-                "top_p": 0.9,
-                "repeat_penalty": float(os.getenv("LLM_REPEAT_PENALTY", "1.15")),
-                "num_predict": NUM_PREDICT,
-                "seed": 42
-            },
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-        }
-        log.info(f"LLM request: model={MODEL}, num_ctx={NUM_CTX}, num_predict={NUM_PREDICT}, "
-             f"temperature={temperature}, keep_alive={KEEP_ALIVE}")
-        log.debug(f"messages={len(payload['messages'])}, context_chars={len(context)}, question_chars={len(question)}")
+            # 2) Собираем payload без messages
+            payload = {
+                "model": MODEL,
+                "stream": False,
+                "keep_alive": KEEP_ALIVE,
+                "options": {
+                    "num_ctx": NUM_CTX,
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                    "repeat_penalty": float(os.getenv("LLM_REPEAT_PENALTY", "1.15")),
+                    "num_predict": NUM_PREDICT,
+                    "seed": 42
+                }
+            }
 
-        # Добавляем историю разговора для контекста
-        with self._lock:
-            hist = list(self.conversation_history[-4:])
-        if hist:
-            for msg in hist:
-                payload["messages"].insert(1, msg)
-        
-        try:
-            # Запрос к Ollama
-            response = requests.post(
-                OLLAMA_URL,
-                json=payload,
-                timeout=REQUEST_TIMEOUT
+            # 3) Сообщения собираем «куском» (system, ...hist..., current user)
+            payload["messages"] = self._pack_messages(system_prompt, user_prompt, hist) # Второй шанс: заменяем ТОЛЬКО текущий user-ход; история (system + hist) остаётся прежней
+
+            # 4) Логи — уже после итоговой сборки messages
+            log.info(
+                f"LLM request: model={MODEL}, num_ctx={NUM_CTX}, num_predict={NUM_PREDICT}, "
+                f"temperature={temperature}, keep_alive={KEEP_ALIVE}"
             )
-            log.info(f"LLM status={response.status_code}, elapsed≈{response.elapsed.total_seconds():.3f}s")
-            if response.status_code >= 400:
-                log.error(f"LLM error body (first 500): {response.text[:500]}")
-            response.raise_for_status()
-            
-            data = response.json()
-            raw_answer = (
-                data.get("message", {}).get("content")
-                or data.get("response")
-                or ""
-            )
-            
-            # Постобработка ответа
-            with timed(log, "post_process_answer"):
-                final_answer = self.post_process_answer(raw_answer, chunks)
-            log.debug(f"final_answer_len={len(final_answer)}")
-            
-            # Добавим ненавязчивую приписку с подсказкой, если LLM сам не назвал этот код
-            if okpd_hint:
-                code_str = str(okpd_hint.get("code", "") or "")
-                if code_str and code_str not in final_answer:
-                    desc = (okpd_hint.get('desc','') or '').replace('\n', ' ')[:180]
-                    if okpd_hint and okpd_hint["conf"] >= OKPD_HINT_MIN_CONF:
-                        tip = (
-                            f"\n\n> ℹ️ Подсказка классификатора ОКПД2: "
-                            f"**{code_str}** ({okpd_hint.get('conf', 0.0):.0%}) — {desc}."
-                        )
-                        final_answer = final_answer + tip
-            
-            # Проверка grounding
-            with timed(log, "check_answer_grounding"):
-                grounding_score = self.check_answer_grounding(final_answer, chunks)
-            log.info(f"Grounding score: {grounding_score:.2%}")
-            logger.info(f"Grounding score: {grounding_score:.2%}")
+            if logger.isEnabledFor(logging.DEBUG):
+                roles = [m.get("role") for m in payload["messages"]]
+                total_chars = sum(len(m.get("content","")) for m in payload["messages"])
+                # локально пересчитаем эффективный бюджет для лога
+                eff_headroom = int(os.getenv("PROMPT_PRED_HEADROOM", "256"))
+                eff_tokens_budget = max(1024, NUM_CTX - NUM_PREDICT - eff_headroom)
+                eff_budget_chars  = int(os.getenv("PROMPT_CHAR_BUDGET", str(eff_tokens_budget * 4)))
+                log.debug(
+                    "LLM order: %s | msgs=%d | chars=%d/%d | hist_tail=%d",
+                    " → ".join(roles), len(payload["messages"]), total_chars, eff_budget_chars, len(hist)
+                )
+                assert roles[0] == "system" and roles[-1] == "user"
 
-            # Второй шанс: если grounding слабый — расширяем поиск и пере-спрашиваем LLM
-            if SMART_RETRY_ENABLE and grounding_score < SMART_RETRY_GROUNDING_THRESHOLD and self.searcher:
-                context_used = context
-                q_norm = normalize_for_retrieval(question + (" " + (okpd_item or "")))
-                exp = build_multiquery_expansions(q_norm)
-                retry = retrieve_and_rerank(self.searcher, exp, topk_per_query=SMART_RETRY_TOPK_PER_QUERY)
-                if retry:
-                    context2 = self.enhance_context(retry[:top_k], question)
-                    if len(context2) > MAX_CONTEXT_CHARS:
-                        context2 = context2[:MAX_CONTEXT_CHARS]
-                    user_prompt2 = self.build_enhanced_prompt(question, context2, q_type)
-                    payload["messages"][-1]["content"] = user_prompt2
-                    try:
-                        response2 = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
-                        response2.raise_for_status()
-                        data2 = response2.json()
-                        raw_answer2 = data2.get("message", {}).get("content") or data2.get("response") or ""
-                        final_answer2 = self.post_process_answer(raw_answer2, retry)
-                        grounding_score2 = self.check_answer_grounding(final_answer2, retry)
-                        log.info(f"Grounding (retry): {grounding_score2:.2%}")
-                        if grounding_score2 > grounding_score:
-                            final_answer, grounding_score, chunks = final_answer2, grounding_score2, retry
-                            context_used = context2
-                    except Exception as e:
-                        log.warning(f"LLM retry error: {e}")
+
+            try:
+                # Запрос к Ollama
+                response = _get_http_session().post(
+                    OLLAMA_URL,
+                    json=payload,
+                    timeout=REQUEST_TIMEOUT
+                )
+                log.info(f"LLM status={response.status_code}, elapsed≈{response.elapsed.total_seconds():.3f}s")
+                if response.status_code >= 400:
+                    log.error(f"LLM error body (first 500): {response.text[:500]}")
+                response.raise_for_status()
                 
-                # Сохраняем в историю (потокобезопасно)
+                data = response.json()
+                raw_answer = (
+                    data.get("message", {}).get("content")
+                    or data.get("response")
+                    or ""
+                )
+                
+                # Постобработка ответа
+                with timed(log, "post_process_answer"):
+                    final_answer = self.post_process_answer(raw_answer, chunks)
+                log.debug(f"final_answer_len={len(final_answer)}")
+                
+                # Добавим ненавязчивую приписку с подсказкой, если LLM сам не назвал этот код
+                if okpd_hint:
+                    code_str = str(okpd_hint.get("code", "") or "")
+                    if code_str and code_str not in final_answer:
+                        desc = (okpd_hint.get('desc','') or '').replace('\n', ' ')[:180]
+                        if okpd_hint and okpd_hint["conf"] >= OKPD_HINT_MIN_CONF:
+                            tip = (
+                                f"\n\n> ℹ️ Подсказка классификатора ОКПД2: "
+                                f"**{code_str}** ({okpd_hint.get('conf', 0.0):.0%}) — {desc}."
+                            )
+                            final_answer = final_answer + tip
+                
+                # Проверка grounding
+                with timed(log, "check_answer_grounding"):
+                    grounding_score = self.check_answer_grounding(final_answer, chunks)
+                log.info(f"Grounding score: {grounding_score:.2%}")
+                logger.info(f"Grounding score: {grounding_score:.2%}")
+
+                # Второй шанс: если grounding слабый — расширяем поиск и пере-спрашиваем LLM
+                if SMART_RETRY_ENABLE and grounding_score < SMART_RETRY_GROUNDING_THRESHOLD and self.searcher:
+                    q_norm = normalize_for_retrieval(question + (" " + (okpd_item or "")))
+                    exp = build_multiquery_expansions(q_norm)
+                    retry = retrieve_and_rerank(self.searcher, exp, topk_per_query=SMART_RETRY_TOPK_PER_QUERY)
+                    if retry:
+                        context2 = self.enhance_context(retry[:top_k], question)
+                        if len(context2) > MAX_CONTEXT_CHARS:
+                            context2 = context2[:MAX_CONTEXT_CHARS]
+
+                        # 1) собираем retry-промпт с предыдущим ответом как черновиком
+                        user_prompt2 = self._build_retry_user_prompt(question, context2, q_type, final_answer)
+
+                        # 2) добавляем черновик как последний ответ ассистента в историю ретрая
+                        hist_for_retry = list(hist) + [
+                            {"role": "assistant", "content": self._clean_prev_answer_for_retry(final_answer)}
+                        ]
+
+                        # 3) ПЕРЕсобираем messages под бюджет (system, ...hist_for_retry..., current user)
+                        payload["messages"] = self._pack_messages(system_prompt, user_prompt2, hist_for_retry)
+
+                        # (опц.) снизим температуру на ретрае
+                        try:
+                            payload["options"]["temperature"] = float(os.getenv("RETRY_TEMPERATURE", "0.3"))
+                        except Exception:
+                            pass
+
+                        if logger.isEnabledFor(logging.DEBUG):
+                            roles = [m.get("role") for m in payload["messages"]]
+                            log.debug("retry LLM order: %s", " → ".join(roles))
+                            assert roles[0] == "system" and roles[-1] == "user"
+
+                        try:
+                            response2 = _get_http_session().post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
+                            response2.raise_for_status()
+                            data2 = response2.json()
+                            raw_answer2 = data2.get("message", {}).get("content") or data2.get("response") or ""
+                            final_answer2 = self.post_process_answer(raw_answer2, retry)
+                            grounding_score2 = self.check_answer_grounding(final_answer2, retry)
+                            log.info(f"Grounding (retry): {grounding_score2:.2%}")
+
+                            if grounding_score2 > grounding_score:
+                                final_answer = final_answer2
+                                grounding_score = grounding_score2
+                                chunks = retry
+                                context_used = context2
+                        except Exception as e:
+                            log.warning(f"LLM retry error: {e}")
+
+                # Единое сохранение истории (и кап из ENV, по умолчанию 20)
+                HIST_STORE_CAP = int(os.getenv("HIST_STORE_CAP", "20"))
                 with self._lock:
                     self.conversation_history.extend([
                         {"role": "user", "content": question},
                         {"role": "assistant", "content": final_answer}
                     ])
-                    if len(self.conversation_history) > 10:
-                        self.conversation_history = self.conversation_history[-10:]
+                    if len(self.conversation_history) > HIST_STORE_CAP:
+                        self.conversation_history = self.conversation_history[-HIST_STORE_CAP:]
 
-                try:
-                    context_len = len(context_used)
-                except NameError:
-                    context_len = len(context)
-
-                # Формируем цитаты
-                citations = []
-                seen = set()
-                def _is_parent(c: Dict) -> bool:
-                    return (c.get('is_parent') is True) or ((c.get('meta') or {}).get('is_parent') is True)
-
-                # Берём чуть больший пул и сортируем: сначала дети, потом родители
-                pool = sorted(chunks[:MAX_CITATIONS * 2], key=lambda x: _is_parent(x))
-
-                for c in pool:
-                    key = (c.get("book", ""), c.get("section", ""), c.get("page", 0))
-                    # если ключ уже занят ребёнком — родителя пропускаем
-                    if key in seen and _is_parent(c):
-                        continue
-                    if key not in seen:
-                        citations.append({
-                            "book": c.get("book", "Unknown"),
-                            "section": c.get("section", "Unknown"),
-                            "page": c.get("page", 0),
-                            "relevance": c.get("score", 0),
-                            "is_parent": _is_parent(c),   # опционально — удобно для UI бейджа «секция»
-                        })
-                        seen.add(key)
-                    if len(citations) >= MAX_CITATIONS:
-                        break
+            except requests.exceptions.ConnectionError:
+                logger.error("Не удалось подключиться к Ollama")
+                # Fallback на простой ответ
+                return ask_simple(question, chunks=chunks)
                 
-                result = {
-                    "answer": final_answer,
-                    "citations": citations,
-                    "question_type": q_type,
-                    "chunks_found": len(chunks),
-                    "processing_time": (datetime.now() - start_time).total_seconds(),
-                    "model": MODEL,
-                    "context_size": context_len,
-                    "grounding_score": grounding_score,
+            except requests.exceptions.Timeout:
+                logger.error("Timeout при запросе к Ollama")
+                # Fallback на простой ответ
+                return ask_simple(question, chunks=chunks)
+                
+            except Exception as e:
+                logger.error(f"Неожиданная ошибка: {e}")
+                return {
+                    "answer": f"Произошла ошибка при генерации ответа: {str(e)}",
+                    "citations": [],
+                    "error": True,
+                    "processing_time": (datetime.now() - start_time).total_seconds()
                 }
-                if okpd_hint:
-                    result["meta"] = {"okpd_hint": okpd_hint}
-                return result
-            
-        except requests.exceptions.ConnectionError:
-            logger.error("Не удалось подключиться к Ollama")
-            # Fallback на простой ответ
-            return ask_simple(question, chunks=chunks)
-            
-        except requests.exceptions.Timeout:
-            logger.error("Timeout при запросе к Ollama")
-            # Fallback на простой ответ
-            return ask_simple(question, chunks=chunks)
-            
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
-            return {
-                "answer": f"Произошла ошибка при генерации ответа: {str(e)}",
-                "citations": [],
-                "error": True,
-                "processing_time": (datetime.now() - start_time).total_seconds()
+
+            citations = []
+            seen = set()
+            def _is_parent(c: Dict) -> bool:
+                return (c.get('is_parent') is True) or ((c.get('meta') or {}).get('is_parent') is True)
+            pool = sorted(
+                chunks[:MAX_CITATIONS * 2],
+                key=lambda x: (_is_parent(x), -float(x.get('score', 0)))  # дети первыми, затем по score
+            )
+            for c in pool:
+                key = (c.get("book", ""), c.get("section", ""), c.get("page", 0))
+                if key in seen and _is_parent(c):
+                    continue
+                if key not in seen:
+                    citations.append({
+                        "book": c.get("book", "Unknown"),
+                        "section": c.get("section", "Unknown"),
+                        "page": c.get("page", 0),
+                        "relevance": c.get("score", 0),
+                        "is_parent": _is_parent(c),
+                    })
+                    seen.add(key)
+                if len(citations) >= MAX_CITATIONS:
+                    break
+
+            result = {
+                "answer": final_answer,
+                "citations": citations,
+                "question_type": q_type,
+                "chunks_found": len(chunks),
+                "processing_time": (datetime.now() - start_time).total_seconds(),
+                "model": MODEL,
+                "context_size": len(context_used),
+                "grounding_score": grounding_score,
             }
-        
-        # --- УСПЕШНЫЙ ПУТЬ (без исключений): сохраняем историю, готовим цитаты, возвращаем результат ---
-        with self._lock:
-            self.conversation_history.extend([
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": final_answer}
-            ])
-            if len(self.conversation_history) > 10:
-                self.conversation_history = self.conversation_history[-10:]
-
-        citations = []
-        seen = set()
-        def _is_parent(c: Dict) -> bool:
-            return (c.get('is_parent') is True) or ((c.get('meta') or {}).get('is_parent') is True)
-        pool = sorted(chunks[:MAX_CITATIONS * 2], key=lambda x: _is_parent(x))
-        for c in pool:
-            key = (c.get("book", ""), c.get("section", ""), c.get("page", 0))
-            if key in seen and _is_parent(c):
-                continue
-            if key not in seen:
-                citations.append({
-                    "book": c.get("book", "Unknown"),
-                    "section": c.get("section", "Unknown"),
-                    "page": c.get("page", 0),
-                    "relevance": c.get("score", 0),
-                    "is_parent": _is_parent(c),
-                })
-                seen.add(key)
-            if len(citations) >= MAX_CITATIONS:
-                break
-
-        result = {
-            "answer": final_answer,
-            "citations": citations,
-            "question_type": q_type,
-            "chunks_found": len(chunks),
-            "processing_time": (datetime.now() - start_time).total_seconds(),
-            "model": MODEL,
-            "context_size": len(context),
-            "grounding_score": grounding_score,
-        }
-        if okpd_hint:
-            result["meta"] = {"okpd_hint": okpd_hint}
-        return result
+            if okpd_hint:
+                result["meta"] = {"okpd_hint": okpd_hint}
+            return result
     
     def clear_history(self):
         """Очистка истории разговора"""
